@@ -1,0 +1,116 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# Set seed for reproducibility
+np.random.seed(42)
+
+# Load dataset
+df = pd.read_excel(
+    "https://raw.githubusercontent.com/adhicurry/ML_HeatTransfer_Fluids/main/FlatPlate_Models/Data_Combined_1.xlsx",
+    engine='openpyxl'
+)
+
+# Convert categorical variable
+df['WallBC'] = df['WallBC'].map({'UWT': 0, 'UHF': 1}).astype(float)
+
+# Filter and reset index
+figures = [2, 3, '4a', '4b', '4c', '4d', '6a', '6b', 8, '9a']
+data_subset = df[df['Figure'].isin(figures)].reset_index(drop=True)
+
+# Select features and target
+X = data_subset[['Rex', 'Pr', 'WallBC', 'c']].values
+y = np.log(data_subset['Nux'].values)  # Log-transform target
+
+# Split dataset
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.15, stratify=data_subset['Figure'].astype(str), random_state=42
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.15, stratify=data_subset.loc[data_subset.index[:len(X_train)], 'Figure'].astype(str),
+    random_state=42
+)
+
+# Scale features
+X_scaler = StandardScaler()
+X_train_scaled = X_scaler.fit_transform(X_train)
+X_val_scaled = X_scaler.transform(X_val)
+X_test_scaled = X_scaler.transform(X_test)
+
+# Save scaler
+joblib.dump(X_scaler, 'X_scaler.save')
+
+# Hyperparameter tuning
+param_dist = {
+    'n_estimators': [200, 500, 1000],
+    'max_depth': [5, 10, 20, None],
+    'min_samples_split': [2, 3, 5, 10],
+    'min_samples_leaf': [1, 2, 5],
+    'max_features': ['sqrt', 'log2'],
+    'bootstrap': [True, False]
+}
+
+rf = RandomForestRegressor(random_state=42)
+cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+random_search = RandomizedSearchCV(
+    estimator=rf, param_distributions=param_dist, n_iter=20, cv=cv,
+    scoring='neg_mean_absolute_error', n_jobs=-1, random_state=42, verbose=1
+)
+
+random_search.fit(X_train_scaled, y_train)
+
+# Best model
+best_rf_model = random_search.best_estimator_
+print("\nBest Hyperparameters:", random_search.best_params_)
+print("Best CV Score (MAE):", -random_search.best_score_)
+
+
+# Function for evaluation
+def evaluate_model(model, X_scaled, y_actual, dataset_name="Test"):
+    preds_log = model.predict(X_scaled)
+    preds = np.exp(preds_log)  # Convert back from log scale
+    y_actual_exp = np.exp(y_actual)
+
+    mae = mean_absolute_error(y_actual_exp, preds)
+    mse = mean_squared_error(y_actual_exp, preds)
+    r2 = r2_score(y_actual_exp, preds)
+
+    print(f"\n--- {dataset_name} Results ---")
+    print(f"{dataset_name} MAE:  {mae:.4f}")
+    print(f"{dataset_name} RMSE: {mse ** 0.5:.4f}")
+    print(f"{dataset_name} R^2:  {r2:.4f}")
+
+    return y_actual_exp, preds
+
+
+# Evaluate on validation and test sets
+y_val_original, val_preds = evaluate_model(best_rf_model, X_val_scaled, y_val, "Validation")
+y_test_original, test_preds = evaluate_model(best_rf_model, X_test_scaled, y_test, "Test")
+
+# Plot predictions vs actual
+plt.figure(figsize=(10, 6))
+plt.loglog(X_scaler.inverse_transform(X_test)[:, 0], y_test_original, 'o', label='Actual')
+plt.loglog(X_scaler.inverse_transform(X_test)[:, 0], test_preds, 'x', label='Predicted')
+plt.title('Random Forest Predictions vs Actual Values (Test Set)')
+plt.xlabel('Rex')
+plt.ylabel('Nux')
+plt.grid(True, which="both", ls="-", alpha=0.2)
+plt.legend()
+plt.show()
+
+# Plot error percentage
+plt.figure(figsize=(10, 6))
+error_percentage = 100.0 * np.abs(test_preds - y_test_original) / np.abs(y_test_original)
+plt.semilogx(X_scaler.inverse_transform(X_test)[:, 0], error_percentage, 'r.')
+plt.title('Prediction Error Percentage vs Rex (Test Set)')
+plt.xlabel('Rex')
+plt.ylabel('Error (%)')
+plt.grid(True, alpha=0.2)
+plt.show()
