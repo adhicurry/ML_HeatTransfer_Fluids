@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib.pyplot as plt
@@ -28,33 +28,18 @@ X_train, X_test, y_train, y_test, fluids_train, fluids_test = train_test_split(
     X, y, df['Fluid'].values, test_size=0.2, random_state=42
 )
 
-# Set up GridSearchCV for Random Forest hyperparameter tuning
-param_grid = {
-    'n_estimators': [100, 300, 500, 1000],  # Number of trees
-    'max_depth': [10, 20, 50, None],         # Maximum depth of trees
-    'min_samples_split': [2, 5, 10],         # Minimum samples to split a node
-    'min_samples_leaf': [1, 2, 4],           # Minimum samples at leaf node
-    'max_features': ['auto', 'sqrt', 'log2'],  # Number of features to consider
-}
-
-# Create the Random Forest model
-rf_model = RandomForestRegressor(random_state=42)
-
-# Initialize GridSearchCV
-grid_search = GridSearchCV(estimator=rf_model, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2, scoring='neg_mean_squared_error')
-
-# Perform the grid search
-grid_search.fit(X_train, y_train)
-
-# Get the best hyperparameters from the grid search
-best_params = grid_search.best_params_
-print(f"Best Parameters: {best_params}")
-
-# Train the Random Forest model with the best hyperparameters
-best_rf_model = grid_search.best_estimator_
-
-# Make predictions using the best model
-y_pred = best_rf_model.predict(X_test)
+# Train Random Forest model with best parameters
+rf_model = RandomForestRegressor(
+    max_depth=20,
+    max_features='sqrt',
+    min_samples_leaf=2,
+    min_samples_split=2,
+    n_estimators=300,
+    random_state=42,
+    bootstrap=True
+)
+rf_model.fit(X_train, y_train)
+y_pred = rf_model.predict(X_test)
 
 # Compute performance metrics
 mse = mean_squared_error(y_test, y_pred)

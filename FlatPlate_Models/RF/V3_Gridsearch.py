@@ -28,32 +28,34 @@ X_train, X_test, y_train, y_test, fluids_train, fluids_test = train_test_split(
     X, y, df['Fluid'].values, test_size=0.2, random_state=42
 )
 
-# Set up GridSearchCV for Random Forest hyperparameter tuning
-param_grid = {
-    'n_estimators': [100, 300, 500, 1000],  # Number of trees
-    'max_depth': [10, 20, 50, None],         # Maximum depth of trees
-    'min_samples_split': [2, 5, 10],         # Minimum samples to split a node
-    'min_samples_leaf': [1, 2, 4],           # Minimum samples at leaf node
-    'max_features': ['auto', 'sqrt', 'log2'],  # Number of features to consider
-}
-
-# Create the Random Forest model
+# Set up the Random Forest model
 rf_model = RandomForestRegressor(random_state=42)
 
-# Initialize GridSearchCV
-grid_search = GridSearchCV(estimator=rf_model, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2, scoring='neg_mean_squared_error')
+# Define an expanded parameter grid for GridSearchCV
+param_grid = {
+    'n_estimators': [100, 150, 200, 250, 300, 400],
+    'max_depth': [5, 10, 20, 30, 40, 50, None],  # Test a wider range of depths
+    'min_samples_split': [2, 5, 10, 15],         # Wider range for splitting nodes
+    'min_samples_leaf': [1, 2, 4, 6],            # Larger range for minimum leaf size
+    'max_features': ['auto', 'sqrt', 'log2', 0.1, 0.2, 0.3, 0.4],  # Try different feature selections
+    'bootstrap': [True, False]                   # Bootstrap sampling options
+}
 
-# Perform the grid search
+# Set up GridSearchCV with cross-validation
+grid_search = GridSearchCV(estimator=rf_model, param_grid=param_grid, 
+                           cv=5, n_jobs=-1, verbose=2, scoring='neg_mean_squared_error')
+
+# Fit GridSearchCV to find the best parameters
 grid_search.fit(X_train, y_train)
 
-# Get the best hyperparameters from the grid search
-best_params = grid_search.best_params_
-print(f"Best Parameters: {best_params}")
+# Print the best parameters
+print("Best Parameters found by GridSearchCV:")
+print(grid_search.best_params_)
 
-# Train the Random Forest model with the best hyperparameters
+# Use the best model from GridSearchCV
 best_rf_model = grid_search.best_estimator_
 
-# Make predictions using the best model
+# Make predictions with the best model
 y_pred = best_rf_model.predict(X_test)
 
 # Compute performance metrics
