@@ -1,0 +1,324 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+
+# Load data
+df = pd.read_excel(
+    "https://raw.githubusercontent.com/adhicurry/ML_HeatTransfer_Fluids/main/FlatPlate_Models/Data_Combined_1.xlsx",
+    engine='openpyxl'
+)
+df['WallBC'] = df['WallBC'].replace({'UWT': 0, 'UHF': 1}).astype(float)
+
+# Use a subset of figures (Air, Water, Oil)
+data_subset = df[df['Figure'].isin([2, 3, '4a', '4b', '4c', '6a', '6b', 8, '9a'])].reset_index(drop=True)
+
+# Features: Rex, Pr, WallBC, c  and target: Nux
+X = data_subset[['Rex', 'Pr', 'WallBC', 'c']].values
+y = data_subset['Nux'].values
+
+# Apply log10 transformation for better scaling/linearity
+X[:, 0] = np.log10(X[:, 0])
+y = np.log10(y)
+
+# Use the 'Figure' column for stratification during splitting
+figures = data_subset['Figure'].astype(str).values
+
+# Split data: first into train_temp (80%) and test (20%), then train_temp into train and validation
+X_train_temp, X_test, y_train_temp, y_test, fig_train_temp, fig_test = train_test_split(
+    X, y, figures, test_size=0.20, stratify=figures, shuffle=True, random_state=42
+)
+X_train, X_val, y_train, y_val, fig_train, fig_val = train_test_split(
+    X_train_temp, y_train_temp, fig_train_temp, test_size=0.15, stratify=fig_train_temp, shuffle=True, random_state=42
+)
+
+# Scale features and target
+X_scaler = StandardScaler()
+y_scaler = StandardScaler()
+
+X_train_scaled = X_scaler.fit_transform(X_train)
+X_val_scaled = X_scaler.transform(X_val)
+X_test_scaled = X_scaler.transform(X_test)
+
+y_train_scaled = y_scaler.fit_transform(y_train.reshape(-1, 1))
+y_val_scaled = y_scaler.transform(y_val.reshape(-1, 1))
+y_test_scaled = y_scaler.transform(y_test.reshape(-1, 1))
+
+# Save scalers for future use
+joblib.dump(X_scaler, 'X_scaler.save')
+joblib.dump(y_scaler, 'y_scaler.save')
+
+# Convert arrays to PyTorch tensors
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# We keep the training data on CPU for our custom dataset; we'll move batches to device.
+X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32)
+X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).to(device)
+y_val_tensor = torch.tensor(y_val_scaled, dtype=torch.float32).to(device)
+X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).to(device)
+y_test_tensor = torch.tensor(y_test_scaled, dtype=torch.float32).to(device)
+
+
+
+
+class CustomTrainDataset(Dataset):
+    def __init__(self, X, y):
+        """
+        X and y should be numpy arrays or tensors on CPU.
+        """
+        # We'll assume they are numpy arrays; if they are tensors, convert them to float32 on CPU.
+        if isinstance(X, np.ndarray):
+            self.X = torch.tensor(X, dtype=torch.float32)
+        else:
+            self.X = X.cpu()  # ensure on CPU
+        if isinstance(y, np.ndarray):
+            self.y = torch.tensor(y, dtype=torch.float32)
+        else:
+            self.y = y.cpu()
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        # Return the sample (and its label) along with its index.
+        return self.X[idx], self.y[idx], idx
+
+
+# Create our custom training dataset
+train_dataset = CustomTrainDataset(X_train_scaled, y_train_scaled)
+# Use a standard TensorDataset for validation and test (we don't need indices there)
+val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+
+class TunedEnhancedResidualMLP(nn.Module):
+    def __init__(self, input_size=4, hidden_size=128, num_blocks=4, dropout_rate=0.10):
+        """
+        A residual MLP with a global skip connection.
+        """
+        super(TunedEnhancedResidualMLP, self).__init__()
+        # Global skip branch (simple linear mapping)
+        self.linear_skip = nn.Linear(input_size, 1)
+        # Main branch: input layer + residual blocks
+        self.input_layer = nn.Linear(input_size, hidden_size)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.BatchNorm1d(hidden_size),
+                nn.LeakyReLU(negative_slope=0.1),
+                nn.Dropout(dropout_rate),
+                nn.Linear(hidden_size, hidden_size)
+            ) for _ in range(num_blocks)
+        ])
+        self.output_layer = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        skip = self.linear_skip(x)
+        out = self.input_layer(x)
+        for block in self.blocks:
+            residual = out
+            out = block(out)
+            out = out + residual
+        out = self.output_layer(out)
+        return out + skip
+
+
+# Initialize the model and move it to device when needed
+model = TunedEnhancedResidualMLP(input_size=4, hidden_size=128, num_blocks=4, dropout_rate=0.10).to(device)
+
+
+
+# We'll use SmoothL1Loss with reduction='none' so we can get per-sample losses.
+criterion = nn.SmoothL1Loss(beta=0.5, reduction='none')
+optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.001)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=150, verbose=True)
+
+batch_size = 256
+# Create a DataLoader for our custom training dataset
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+# Standard loaders for validation
+val_loader = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False)
+
+# Initialize sample weights (one per training sample); start with 1 for all.
+num_train_samples = len(train_dataset)
+sample_weights = torch.ones(num_train_samples, device=device)
+
+# Hyperparameter for reweighting update (adjust as needed)
+alpha = 0.5
+epsilon = 1e-8
+
+num_epochs = 5000
+early_stop_patience = 500
+best_val_loss = float('inf')
+best_model_state = None
+patience_counter = 0
+train_losses = []
+val_losses = []
+
+
+# Function to update sample weights over the entire training set
+def update_sample_weights(model, dataset, current_weights, alpha=0.5, epsilon=1e-8):
+    model.eval()
+    # Create a DataLoader that goes through the entire training set (without shuffling)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    all_losses = []
+    with torch.no_grad():
+        for batch_x, batch_y, indices in loader:
+            # Move batch_x and batch_y to device
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            outputs = model(batch_x)
+            # Compute per-sample loss; shape will be [batch, 1]
+            losses = criterion(outputs, batch_y)
+            # Squeeze to shape [batch]
+            losses = losses.squeeze(1)
+            all_losses.append((indices, losses.cpu()))
+    # Create a tensor to hold losses for all samples
+    loss_array = torch.zeros(len(dataset))
+    for indices, losses in all_losses:
+        loss_array[indices] = losses
+    max_loss = loss_array.max().item() + epsilon
+    # Update rule: new_weight = 1 + alpha * (loss / max_loss)
+    new_weights = 1.0 + alpha * (loss_array / max_loss)
+    return new_weights.to(device), loss_array
+
+
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0.0
+    for batch_x, batch_y, batch_indices in train_loader:
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
+        optimizer.zero_grad()
+        outputs = model(batch_x)
+        # Compute per-sample losses (shape [batch, 1]); squeeze to [batch]
+        losses = criterion(outputs, batch_y).squeeze(1)
+        # Retrieve corresponding weights for this batch (sample_weights is maintained on device)
+        batch_weights = sample_weights[batch_indices]
+        weighted_loss = (losses * batch_weights).mean()
+        weighted_loss.backward()
+        optimizer.step()
+        epoch_loss += weighted_loss.item() * len(batch_x)
+    epoch_loss /= num_train_samples
+    train_losses.append(epoch_loss)
+
+    model.eval()
+    with torch.no_grad():
+        for val_x, val_y in val_loader:
+            val_x = val_x.to(device)
+            val_y = val_y.to(device)
+            val_outputs = model(val_x)
+            val_loss = nn.SmoothL1Loss(beta=0.5)(val_outputs, val_y).item()
+    val_losses.append(val_loss)
+    scheduler.step(val_loss)
+
+
+    sample_weights, epoch_sample_losses = update_sample_weights(model, train_dataset, sample_weights, alpha, epsilon)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_model_state = model.state_dict()
+        patience_counter = 0
+    else:
+        patience_counter += 1
+
+    if patience_counter >= early_stop_patience:
+        print(f"Early stopping triggered at epoch {epoch + 1}")
+        break
+
+    if (epoch + 1) % 10 == 0:
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {epoch_loss:.6f}, Val Loss: {val_loss:.6f}")
+
+print(f"Best validation loss: {best_val_loss:.6f}")
+
+plt.figure(figsize=(10, 6))
+plt.plot(train_losses, label='Train Loss')
+plt.plot(val_losses, label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss with Dynamic Reweighting')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+
+torch.save(best_model_state, 'best_DynamicReweighting_Model.pth')
+model.load_state_dict(best_model_state)
+
+
+
+def calculate_metrics(predictions, actuals):
+    error_pct = 100 * np.abs(predictions - actuals) / actuals
+    return {
+        'MAE': np.mean(np.abs(predictions - actuals)),
+        'Average_Percentage_Error': np.mean(error_pct),
+        'Min_Error': np.min(error_pct),
+        'Max_Error': np.max(error_pct),
+        'Median_Error': np.median(error_pct),
+        'Percentile_68': np.percentile(error_pct, 68),
+        'Percentile_95': np.percentile(error_pct, 95),
+        'Percentile_99': np.percentile(error_pct, 99)
+    }
+
+
+model.eval()
+with torch.no_grad():
+    preds = model(X_test_tensor).cpu().numpy()
+    y_test_np = y_test_tensor.cpu().numpy()
+
+
+preds_log = y_scaler.inverse_transform(preds)
+y_test_log = y_scaler.inverse_transform(y_test_np)
+preds_original = 10 ** preds_log
+y_test_original = 10 ** y_test_log
+
+# Overall metrics
+metrics = calculate_metrics(preds_original, y_test_original)
+print("Dynamic Reweighting Model Evaluation Metrics (Overall):")
+for k, v in metrics.items():
+    print(f"{k}: {v:.2f}")
+
+
+substance_mapping = {
+    '2': 'Air',
+    '8': 'Air',
+    '3': 'Water',
+    '6a': 'Water',
+    '6b': 'Water',
+    '4a': 'Oil',
+    '4b': 'Oil',
+    '4c': 'Oil',
+    '9a': 'Oil'
+}
+
+substances = np.array([substance_mapping[str(fig)] for fig in fig_test])
+unique_substances = np.unique(substances)
+
+print("\nError Metrics per Substance:")
+for substance in unique_substances:
+    mask = (substances == substance)
+    preds_sub = preds_original[mask]
+    actuals_sub = y_test_original[mask]
+    metrics_sub = calculate_metrics(preds_sub, actuals_sub)
+    print(f"\nSubstance: {substance}")
+    for k, v in metrics_sub.items():
+        print(f"{k}: {v:.2f}")
+
+
+X_test_unscaled = X_scaler.inverse_transform(X_test_scaled)
+Rex_test = 10 ** X_test_unscaled[:, 0]
+plt.figure(figsize=(10, 6))
+plt.loglog(Rex_test, y_test_original, 'o', label='Actual Data')
+plt.loglog(Rex_test, preds_original, 'x', label='Predictions with Dynamic Reweighting')
+plt.xlabel('Rex')
+plt.ylabel('Nux')
+plt.title('Predictions vs Actual with Dynamic Reweighting')
+plt.legend()
+plt.grid(True, which="both", ls="-", alpha=0.2)
+plt.show()
