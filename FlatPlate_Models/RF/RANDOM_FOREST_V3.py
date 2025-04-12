@@ -1,27 +1,29 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
-import matplotlib.pyplot as plt
 
 # Load dataset
-df = pd.read_excel("https://raw.githubusercontent.com/adhicurry/ML_HeatTransfer_Fluids/main/FlatPlate_Models/Data_Combined_1.xlsx", engine='openpyxl')
+df = pd.read_excel(
+    "https://raw.githubusercontent.com/adhicurry/ML_HeatTransfer_Fluids/main/FlatPlate_Models/Data_Combined_1.xlsx",
+    engine='openpyxl'
+)
 
-# Convert categorical data to numerical
 df['WallBC'] = df['WallBC'].replace({'UWT': 0, 'UHF': 1}).astype(float)
 
-# Ensure the dataset has a 'Fluid' column
 if 'Fluid' not in df.columns:
     raise ValueError("Dataset must contain a 'Fluid' column to categorize fluids.")
 
-# Define features and target variable
-X = df[['Rex', 'Pr', 'WallBC']].values
+feature_columns = ['Rex', 'Pr', 'WallBC']
+  
+
+X = df[feature_columns].values
 y = df['Nux'].values
 
-# Log transformation
-X[:, 0] = np.log10(X[:, 0])  # Log transform Rex
-y = np.log10(y)              # Log transform Nux
+X[:, 0] = np.log10(X[:, 0])  
+y = np.log10(y)              
 
 # Train-test split
 X_train, X_test, y_train, y_test, fluids_train, fluids_test = train_test_split(
@@ -30,11 +32,11 @@ X_train, X_test, y_train, y_test, fluids_train, fluids_test = train_test_split(
 
 # Train Random Forest model with best parameters
 rf_model = RandomForestRegressor(
-    max_depth=20,
+    max_depth=30,
     max_features='sqrt',
     min_samples_leaf=2,
     min_samples_split=2,
-    n_estimators=300,
+    n_estimators=500,
     random_state=42,
     bootstrap=True
 )
@@ -52,7 +54,7 @@ actual_Rex = np.exp(X_test[:, 0])
 predicted_Nux = np.exp(y_pred)     
 actual_Nux = np.exp(y_test)        
 
-# Calculate percentage errors for each sample
+# Compute percentage errors for each sample
 error_percentages = np.abs((actual_Nux - predicted_Nux) / actual_Nux) * 100
 
 # Store results in a DataFrame
@@ -84,12 +86,12 @@ overall_error_stats = {
     '99th %': np.percentile(error_percentages, 99)
 }
 
-# Add overall error statistics to the fluid error stats table
-overall_error_df = pd.DataFrame(overall_error_stats, index=['overall'])
+# Convert overall stats to a DataFrame and combine with fluid-specific stats
+overall_error_df = pd.DataFrame(overall_error_stats, index=['Overall'])
 combined_error_stats = pd.concat([fluid_error_stats, overall_error_df])
 
 # Print the combined error statistics table
-print("\nError statistics by fluid and overall:")
+print("\nError Statistics by Fluid and Overall:")
 print(combined_error_stats)
 
 # Plot predictions vs actual values
